@@ -1,0 +1,826 @@
+// === MASTER: ESPxOS v0.6 (robust framing, retries, guards) ===
+// Board: ESP32 Dev Module (Arduino core 2.x)
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <U8g2lib.h>
+#include <vector>
+#include <string.h>
+
+// ---------- Pins ----------
+#define OLED_SCL   18
+#define OLED_SDA   5
+#define BTN_UP     23
+#define BTN_DOWN   22
+#define BTN_SELECT 21
+#define BTN_BACK   19
+#define LED_RED    12
+#define LED_GREEN  14
+#define BUZZER_PIN 17
+#define SLAVE_RX   25
+#define SLAVE_TX   26
+#define SLAVE_BAUD 115200
+
+// ---------- OLED ----------
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+const int X_MARGIN=2, LINE_H=10, TOP_BAR_H=12, STATUS_H=10;
+
+// ---------- UI State ----------
+enum UIState {
+  ST_HOME, ST_FILES, ST_VIEWTXT, ST_HEXVIEW, ST_EXTRUN, ST_SETTINGS,
+  ST_PANIC, ST_CONFIRM, ST_CTXMENU, ST_ADJUST_CONTRAST, ST_SYSINFO,
+  ST_RENAME, ST_TOOLS, ST_PROPERTIES
+};
+UIState ui = ST_HOME;
+
+// Home + Settings + Tools
+const char* homeItems[] = {"File Explorer", "Settings", "Tools", "About"};
+int homeSel = 0;
+const char* settingsItems[] = {
+  "Re-check Slave", "Panic Test",
+  "Adjust Contrast", "Theme (Normal/Invert)",
+  "View Logs", "Clear Panic Flag",
+  "Keymap (Swap Up/Down)", "System Info",
+  "Purge Trash", "Back"
+};
+const int settingsCount = sizeof(settingsItems)/sizeof(settingsItems[0]);
+int settingsSel = 0, settingsTop=0;
+
+const char* toolsItems[] = { "Stopwatch", "Timer", "Back" };
+int toolsSel=0, toolsTop=0;
+
+// Context menus
+enum CtxMode { CTX_FILE, CTX_DIR, CTX_DIR_EMPTY };
+CtxMode ctxMode = CTX_FILE;
+int ctxTop = 0, ctxSel = 0;
+const char* ctxFileMenu[] = {"Open", "Hex View", "Properties", "Rename", "Copy/Move", "Delete", "Back"};
+const int   ctxFileCount  = 7;
+const char* ctxDirMenu[]  = {"Open", "Properties", "Copy/Move", "Delete", "Back"};
+const int   ctxDirCount   = 5;
+const char* ctxEmptyMenu[]= {"New Folder", "New Text", "Paste", "Back"};
+const int   ctxEmptyCount = 4;
+
+// File listing
+struct Entry { String name; bool isDir; size_t size; };
+std::vector<Entry> entries;
+int sel=0, top=0;
+String cwd="/";
+
+// viewers
+File txtFile; int txtOff=0; // line offset
+File hexFile; size_t hexOffset=0;
+
+// confirm
+String confirmTitle; String confirmDetail; void (*confirmYes)() = nullptr;
+
+// flags
+bool safeMode=false;
+uint8_t contrast=255;
+bool themeInvert=false;
+
+// keymap & input
+struct Key { uint8_t pin; bool last=false; uint32_t downAt=0; bool repeating=false; };
+Key kUp{BTN_UP}, kDn{BTN_DOWN}, kSel{BTN_SELECT}, kBk{BTN_BACK};
+bool swapUpDown=false;
+const uint32_t REPEAT_DELAY=300, REPEAT_INTERVAL=80;
+
+// mark/paste
+bool hasMark=false; String markPath; bool markIsDir=false;
+
+// rename
+const char* alpha="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+int rnAlpha=0; String rnName;
+
+// properties cache
+Entry propEntry;
+
+// screensaver / idle
+uint32_t lastInputMs=0;
+const uint32_t DIM_MS=30000;   // 30s -> dim
+const uint32_t BLANK_MS=60000; // 60s -> blank
+bool dimmed=false, blanked=false;
+
+// ext app permissions (caps)
+struct Caps { bool oled=true, led=true, buzzer=true; };
+Caps extCaps;
+
+// watchdog (safer)
+const uint32_t PING_INTERVAL_MS=1000;
+const uint8_t  PONG_MISS_LIMIT=8;
+const uint32_t WATCHDOG_GRACE_MS=8000;
+uint32_t extLastPing=0, extRunStartMs=0; int extMissedPongs=0;
+
+// LED state (stable, no readback)
+bool ledR=false, ledG=false;
+
+// ---------- Utils ----------
+void beep(uint16_t f=1800,uint16_t ms=30){ tone(BUZZER_PIN,f,ms); }
+void setLED(bool r,bool g){ ledR=r; ledG=g; digitalWrite(LED_RED,r); digitalWrite(LED_GREEN,g); }
+
+bool rawDown(uint8_t pin){ return digitalRead(pin)==LOW; }
+bool debouncedDown(uint8_t pin){
+  static uint32_t t[64]={0}; static uint8_t s[64]={0};
+  uint8_t i=pin%64; bool v=rawDown(pin);
+  if(v != (s[i]&1)){ if(millis()-t[i]>10){ s[i]^=1; t[i]=millis(); } }
+  else t[i]=millis();
+  return (s[i]&1);
+}
+inline bool btnDown(uint8_t pin){ return debouncedDown(pin); }
+
+int edgeRepeat(Key& k){
+  bool now = btnDown(k.pin);
+  uint32_t t = millis();
+  int ev=0; if(now && !k.last){ k.downAt=t; k.repeating=false; ev=1; }
+  else if(!now && k.last){ k.repeating=false; ev=2; }
+  else if(now){
+    if(!k.repeating && t-k.downAt>=REPEAT_DELAY){ k.repeating=true; ev=1; k.downAt=t; }
+    else if(k.repeating && t-k.downAt>=REPEAT_INTERVAL){ ev=1; k.downAt=t; }
+  }
+  k.last=now; return ev;
+}
+
+// CRC16-CCITT
+uint16_t crc16(const uint8_t* d, size_t n){
+  uint16_t c=0xFFFF; while(n--){ c^=((uint16_t)*d++)<<8; for(int i=0;i<8;i++) c=(c&0x8000)?(c<<1)^0x1021:(c<<1);} return c;
+}
+
+// idle handling
+void touchActivity(){ lastInputMs=millis(); if(blanked){ blanked=false; u8g2.setPowerSave(0);} if(dimmed){ dimmed=false; u8g2.setContrast(contrast);} }
+void idleCheck(){
+  uint32_t now=millis(); if(!dimmed && now-lastInputMs>DIM_MS){ dimmed=true; u8g2.setContrast(max<int>(20,contrast/6)); }
+  if(!blanked && now-lastInputMs>BLANK_MS){ blanked=true; u8g2.setPowerSave(1); }
+}
+
+// ---------- FS helpers ----------
+String joinPath(const String& base,const String& name){ return base=="/"? "/"+name: base+"/"+name; }
+bool ensureDir(const char* p){ if(LittleFS.exists(p)) return true; return LittleFS.mkdir(p); }
+bool pathExists(const String& p){ return LittleFS.exists(p); }
+
+void saveKV(const char* path, const String& v){ ensureDir("/sys"); File f=LittleFS.open(path,"w"); if(f){ f.print(v); f.close(); } }
+String loadKV(const char* path){ File f=LittleFS.open(path,"r"); if(!f) return ""; String s=f.readString(); f.close(); s.trim(); return s; }
+
+void saveLastDir(){
+  ensureDir("/sys");
+  File f=LittleFS.open("/sys/lastdir.cfg","w"); if(f){ f.println(cwd); f.println(sel); f.close(); }
+}
+void loadLastDir(){
+  File f=LittleFS.open("/sys/lastdir.cfg","r"); if(!f) return;
+  String d=f.readStringUntil('\n'); d.trim(); int s=f.readStringUntil('\n').toInt(); f.close();
+  if(d.length() && LittleFS.exists(d)){ cwd=d; sel=s; }
+}
+
+void scanDir(const String& path){
+  entries.clear(); sel=0; top=0; cwd=path;
+  File dir=LittleFS.open(path); if(!dir || !dir.isDirectory()) return;
+  if(path!="/") entries.push_back(Entry{"..",true,0});
+  dir=LittleFS.open(path);
+  for(File f=dir.openNextFile(); f; f=dir.openNextFile()) if(f.isDirectory()) entries.push_back({String(f.name()),true,0});
+  dir=LittleFS.open(path);
+  for(File f=dir.openNextFile(); f; f=dir.openNextFile()) if(!f.isDirectory()) entries.push_back({String(f.name()),false,(size_t)f.size()});
+}
+
+void moveToTrash(const String& p){
+  ensureDir("/trash");
+  String base=p.substring(p.lastIndexOf('/')+1);
+  String dst="/trash/"+String((unsigned long)millis())+"_"+base;
+  LittleFS.rename(p,dst);
+}
+
+// ---------- Drawing ----------
+void header(const String& t){
+  if(blanked) return;
+  if(themeInvert){ u8g2.setDrawColor(1); u8g2.drawBox(0,0,128,TOP_BAR_H); u8g2.setDrawColor(0); }
+  else { u8g2.setDrawColor(0); u8g2.drawBox(0,0,128,TOP_BAR_H); u8g2.setDrawColor(1); }
+  u8g2.setFont(u8g2_font_6x10_tf);
+  String h=t; if(safeMode) h="[SAFE] "+h;
+  u8g2.drawStr(X_MARGIN,TOP_BAR_H-3,h.c_str());
+  u8g2.setDrawColor(1);
+}
+void statusLeft(const String& left){
+  if(blanked) return;
+  if(themeInvert){ u8g2.setDrawColor(1); u8g2.drawBox(0,64-STATUS_H,128,STATUS_H); u8g2.setDrawColor(0); }
+  else { u8g2.setDrawColor(0); u8g2.drawBox(0,64-STATUS_H,128,STATUS_H); u8g2.setDrawColor(1); }
+  u8g2.setFont(u8g2_font_5x8_tf);
+  char buf[32];
+  snprintf(buf,sizeof(buf),"%.1f/%.1fKB", LittleFS.usedBytes()/1024.0, LittleFS.totalBytes()/1024.0);
+  u8g2.drawStr(X_MARGIN,64-2,left.c_str());
+  int w=u8g2.getStrWidth(buf); u8g2.drawStr(128-w-X_MARGIN,64-2,buf);
+  u8g2.setDrawColor(1);
+}
+void scrollbar(int total,int topIdx,int vis){
+  if(blanked) return;
+  if(total<=vis) return;
+  int trackY=TOP_BAR_H+2, trackH=64-TOP_BAR_H-STATUS_H-4;
+  u8g2.drawFrame(126,trackY-1,2,trackH+2);
+  float ratio=(float)vis/total; int th=max(4,(int)(trackH*ratio));
+  int ty=trackY + (int)((float)topIdx/total * (trackH-th));
+  u8g2.drawBox(126,ty,2,th);
+}
+
+// ---------- Screens ----------
+void drawMenuList(const char* title, const char** items, int count, int selIdx, int &topIdx, const char* footer){
+  u8g2.clearBuffer(); header(title);
+  int vis=(64-TOP_BAR_H-STATUS_H)/LINE_H;
+  int s=selIdx; if(s<0) s=0; if(s>count-1) s=count-1;
+  if(s<topIdx) topIdx=s; if(s>=topIdx+vis) topIdx=s-vis+1;
+  u8g2.setFont(u8g2_font_6x10_tf);
+  for(int i=0;i<vis;i++){
+    int idx=topIdx+i; if(idx>=count) break; int y=TOP_BAR_H+2+LINE_H*(i+1);
+    if(idx==selIdx) u8g2.drawBox(X_MARGIN,y-8,122,10);
+    if(idx==selIdx){ u8g2.setDrawColor(0); u8g2.drawStr(X_MARGIN+2,y,items[idx]); u8g2.setDrawColor(1); }
+    else           { u8g2.drawStr(X_MARGIN+2,y,items[idx]); }
+  }
+  scrollbar(count, topIdx, vis);
+  statusLeft(footer?footer:""); u8g2.sendBuffer();
+}
+void screenHome(){
+  setLED(false,true);
+  u8g2.clearBuffer(); header("ESPxOS v0.6");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  for(int i=0;i<4;i++){
+    int y=TOP_BAR_H+2+LINE_H*(i+1);
+    if(i==homeSel) u8g2.drawBox(X_MARGIN,y-8,122,10);
+    if(i==homeSel){ u8g2.setDrawColor(0); u8g2.drawStr(X_MARGIN+2,y,homeItems[i]); u8g2.setDrawColor(1); }
+    else          { u8g2.drawStr(X_MARGIN+2,y,homeItems[i]); }
+  }
+  statusLeft("UP/DN select  SEL OK"); u8g2.sendBuffer();
+}
+void drawFiles(bool footer=true){
+  setLED(false,false);
+  u8g2.clearBuffer(); header(cwd);
+  int vis=(64-TOP_BAR_H-STATUS_H)/LINE_H;
+  if(sel<0) sel=0; if(sel>=(int)entries.size()) sel=max(0,(int)entries.size()-1);
+  if(sel<top) top=sel; if(sel>=top+vis) top=sel-vis+1;
+  u8g2.setFont(u8g2_font_6x10_tf);
+  for(int i=0;i<vis;i++){
+    int idx=top+i; if(idx>=(int)entries.size()) break; int y=TOP_BAR_H+2+LINE_H*(i+1);
+    bool s=(idx==sel); if(s) u8g2.drawBox(X_MARGIN,y-8,122,10);
+    String label = entries[idx].isDir ? (entries[idx].name==".."?"[..]":"[D] "+entries[idx].name) : ("    "+entries[idx].name);
+    if(s){ u8g2.setDrawColor(0); u8g2.drawStr(X_MARGIN+2,y,label.c_str()); u8g2.setDrawColor(1); }
+    else  u8g2.drawStr(X_MARGIN+2,y,label.c_str());
+  }
+  scrollbar(entries.size(),top,vis);
+  if(footer){
+    if(entries.empty()) statusLeft("Empty. SEL=Menu  BK=Back");
+    else{
+      Entry &e=entries[sel];
+      char b[48]; if(e.isDir) snprintf(b,sizeof(b), "[dir] %s", e.name.c_str());
+      else snprintf(b,sizeof(b), "%s : %u B", e.name.c_str(), (unsigned)e.size);
+      statusLeft(b);
+    }
+  } else statusLeft("");
+  u8g2.sendBuffer();
+}
+void screenFiles(){ drawFiles(true); }
+void screenViewTxt(){
+  setLED(true,false);
+  u8g2.clearBuffer(); header(entries[sel].name);
+  int vis=(64-TOP_BAR_H-STATUS_H)/LINE_H;
+  u8g2.setFont(u8g2_font_6x10_tf);
+  txtFile.seek(0);
+  for(int i=0;i<txtOff && txtFile.available(); i++) txtFile.readStringUntil('\n');
+  for(int r=0;r<vis && txtFile.available(); r++){
+    String ln=txtFile.readStringUntil('\n'); ln.replace("\r","");
+    int y=TOP_BAR_H+2+LINE_H*(r+1); u8g2.drawStr(X_MARGIN,y,ln.c_str());
+  }
+  statusLeft("UP/DN scroll  SEL pg  BK back"); u8g2.sendBuffer();
+}
+void screenHexView(){
+  u8g2.clearBuffer(); header("Hex: "+entries[sel].name);
+  u8g2.setFont(u8g2_font_5x8_tf);
+  const int lines=(64-TOP_BAR_H-STATUS_H)/8, BPL=8;
+  hexFile.seek(hexOffset);
+  for(int r=0;r<lines;r++){
+    uint8_t buf[BPL]; size_t n=hexFile.read(buf,BPL); if(n==0) break;
+    char line[64]; char* p=line; p+=sprintf(p,"%06u: ",(unsigned)(hexOffset+r*BPL));
+    for(size_t i=0;i<n;i++) p+=sprintf(p,"%02X ",buf[i]); *p=0;
+    u8g2.drawStr(2,TOP_BAR_H+8*(r+1),line);
+  }
+  statusLeft("UP/DN scroll  SEL pg  BK back"); u8g2.sendBuffer();
+}
+void screenSettings(){ drawMenuList("Settings", settingsItems, settingsCount, settingsSel, settingsTop, "UP/DN move  SEL run  BK back"); }
+void screenTools(){ drawMenuList("Tools", toolsItems, 3, toolsSel, toolsTop, "UP/DN move  SEL run  BK back"); }
+void screenCtxMenu(){
+  if(entries.empty()){ drawMenuList(cwd.c_str(), ctxEmptyMenu, ctxEmptyCount, ctxSel, ctxTop, "UP/DN move  SEL run  BK cancel"); return; }
+  Entry &e=entries[sel];
+  if(e.name==".." || e.isDir){
+    drawMenuList("Folder Menu", ctxDirMenu, ctxDirCount, ctxSel, ctxTop, "UP/DN move  SEL run  BK cancel");
+  } else {
+    drawMenuList("File Menu", ctxFileMenu, ctxFileCount, ctxSel, ctxTop, "UP/DN move  SEL run  BK cancel");
+  }
+}
+void screenConfirm(const String& title,const String& detail){
+  u8g2.clearBuffer(); header(title); u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(2,TOP_BAR_H+12,detail.c_str()); u8g2.drawStr(2,TOP_BAR_H+24,"SEL Yes  BK No");
+  statusLeft(""); u8g2.sendBuffer();
+}
+void screenContrast(){
+  u8g2.clearBuffer(); header("Adjust Contrast"); u8g2.setFont(u8g2_font_6x10_tf);
+  char l[32]; snprintf(l,sizeof(l),"Value: %u",contrast); u8g2.drawStr(2,TOP_BAR_H+16,l);
+  u8g2.drawFrame(2,TOP_BAR_H+28,124,8); int w=map(contrast,0,255,0,122); u8g2.drawBox(3,TOP_BAR_H+29,w,6);
+  statusLeft("UP/DN adjust  SEL save  BK cancel"); u8g2.sendBuffer();
+}
+void screenSysInfo(){
+  u8g2.clearBuffer(); header("System Info"); u8g2.setFont(u8g2_font_6x10_tf);
+  char l[40];
+  snprintf(l,sizeof(l),"Uptime: %lus",(unsigned)(millis()/1000)); u8g2.drawStr(2,TOP_BAR_H+12,l);
+  snprintf(l,sizeof(l),"Heap: %lu",(unsigned long)ESP.getFreeHeap()); u8g2.drawStr(2,TOP_BAR_H+24,l);
+  snprintf(l,sizeof(l),"FS: %.1f/%.1fKB",LittleFS.usedBytes()/1024.0,LittleFS.totalBytes()/1024.0); u8g2.drawStr(2,TOP_BAR_H+36,l);
+  snprintf(l,sizeof(l),"Link: miss=%d grace=%lus",extMissedPongs,(unsigned)(WATCHDOG_GRACE_MS/1000)); u8g2.drawStr(2,TOP_BAR_H+48,l);
+  statusLeft("BK back"); u8g2.sendBuffer();
+}
+void screenRename(){
+  u8g2.clearBuffer(); header("Rename"); u8g2.setFont(u8g2_font_6x10_tf);
+  String show = rnName + String("_") + alpha[rnAlpha];
+  u8g2.drawStr(2,TOP_BAR_H+16,show.c_str());
+  statusLeft("UP/DN char  SEL add  BK save"); u8g2.sendBuffer();
+}
+void screenProps(){
+  u8g2.clearBuffer(); header("Properties"); u8g2.setFont(u8g2_font_6x10_tf);
+  char l[64];
+  snprintf(l,sizeof(l),"Name: %s", propEntry.name.c_str()); u8g2.drawStr(2,TOP_BAR_H+12,l);
+  snprintf(l,sizeof(l),"Type: %s", propEntry.isDir?"Folder":"File"); u8g2.drawStr(2,TOP_BAR_H+24,l);
+  if(!propEntry.isDir){ snprintf(l,sizeof(l),"Size: %u B",(unsigned)propEntry.size); u8g2.drawStr(2,TOP_BAR_H+36,l); }
+  statusLeft("BK back"); u8g2.sendBuffer();
+}
+
+// ---------- PC Serial (LIST, UPLOAD, PUTHEX with CRC, PANIC) ----------
+String pcBuf;
+
+void screenProgress(uint32_t done,uint32_t total,const char* title="Sending…"){
+  u8g2.clearBuffer(); header(title);
+  int w = total? (int)((done*120.0)/total) : 0;
+  u8g2.drawFrame(X_MARGIN,32,124,8); u8g2.drawBox(X_MARGIN+1,33,max(0,w-2),6);
+  char b[32]; snprintf(b,sizeof(b),"%lu/%lu",(unsigned long)done,(unsigned long)total);
+  statusLeft(b); u8g2.sendBuffer();
+}
+
+void enterPanic(const char* reason); // fwd
+
+void handlePCcmd(const String& cmd){
+  String c=cmd; c.replace("\r",""); c.trim(); if(!c.length()) return;
+  String up=c; up.toUpperCase();
+
+  if(up=="LIST"){ for(auto&e:entries) Serial.println(e.name); Serial.println("END"); return; }
+
+  if(up.startsWith("UPLOAD ")){ // text lines, END terminator
+    String name=c.substring(7); name.trim(); if(!name.length()){ Serial.println("ERR NO_NAME"); return; }
+    size_t freeB=LittleFS.totalBytes()-LittleFS.usedBytes(); if(freeB<1024){ Serial.println("ERR NO_SPACE"); return; }
+    Serial.println("READY");
+    String path=joinPath(cwd,name); File f=LittleFS.open(path+".tmp","w");
+    while(true){ while(!Serial.available()) delay(1); String ln=Serial.readStringUntil('\n'); ln.replace("\r",""); ln.trim(); if(ln=="END") break; f.println(ln); }
+    f.close(); LittleFS.remove(path); LittleFS.rename(path+".tmp",path); scanDir(cwd); Serial.println("OK"); return;
+  }
+
+  if(up.startsWith("PUTHEX ")){ // PUTHEX <name>
+    String name=c.substring(7); name.trim(); if(!name.length()){ Serial.println("ERR NO_NAME"); return; }
+    String path=joinPath(cwd,name); File f=LittleFS.open(path+".tmp","w");
+    Serial.println("READY");
+    while(true){
+      while(!Serial.available()) delay(1);
+      String ln=Serial.readStringUntil('\n'); ln.replace("\r",""); ln.trim();
+      if(ln=="END") break;
+      // line: H <HEX...> *CCCC
+      if(!ln.startsWith("H ")){ Serial.println("ERR LINE"); continue; }
+      int star=ln.lastIndexOf('*'); if(star<3){ Serial.println("ERR CRC"); continue; }
+      String hex=ln.substring(2, star); hex.trim();
+      String cs =ln.substring(star+1); cs.trim();
+      // decode
+      std::vector<uint8_t> buf; buf.reserve(hex.length()/2);
+      for(int i=0;i+1<(int)hex.length(); i+=2){ buf.push_back((uint8_t)strtoul(hex.substring(i,i+2).c_str(),nullptr,16)); }
+      uint16_t cc=crc16(buf.data(), buf.size());
+      uint16_t rx=(uint16_t)strtoul(cs.c_str(),nullptr,16);
+      if(cc!=rx){ Serial.println("NAK"); continue; }
+      f.write(buf.data(), buf.size()); Serial.println("ACK");
+    }
+    f.close(); LittleFS.remove(path); LittleFS.rename(path+".tmp",path); scanDir(cwd); Serial.println("OK"); return;
+  }
+
+  if(up.startsWith("PANIC")){ String reason=c.length()>5?c.substring(6):"PC-triggered"; enterPanic(reason.c_str()); Serial.println("OK"); return; }
+
+  Serial.println("ERR UNKNOWN");
+}
+void pollPCSerial(){
+  while(Serial.available()){
+    char ch=(char)Serial.read(); if(ch=='\r') continue;
+    if(ch=='\n'){ handlePCcmd(pcBuf); pcBuf=""; } else pcBuf+=ch;
+  }
+}
+
+// ---------- Slave link ----------
+String slaveLineBuf;
+bool readSlaveLine(String& out){
+  while(Serial2.available()){
+    char c=(char)Serial2.read();
+    if(c=='\n'){ slaveLineBuf.replace("\r",""); slaveLineBuf.trim(); out=slaveLineBuf; slaveLineBuf=""; return true; }
+    else slaveLineBuf+=c;
+  } return false;
+}
+void slaveSend(const String& s){ Serial2.print(s); Serial2.print("\n"); }
+
+// Render with caps enforcement
+void renderSlaveCmd(const String& ln){
+  if(ln=="OLED.CLEAR"){ if(extCaps.oled) u8g2.clearBuffer(); return; }
+  if(ln.startsWith("OLED.TEXT")){ if(!extCaps.oled) return;
+    int p=10; int sp1=ln.indexOf(' ',p); if(sp1<0) return; int sp2=ln.indexOf(' ',sp1+1); if(sp2<0) return;
+    int x=ln.substring(p,sp1).toInt(); int y=ln.substring(sp1+1,sp2).toInt();
+    int q1=ln.indexOf('"',sp2+1), q2=ln.lastIndexOf('"'); String s=(q1>=0&&q2>q1)?ln.substring(q1+1,q2):"";
+    u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(x,y,s.c_str()); return;
+  }
+  if(ln=="OLED.UPDATE"){ if(extCaps.oled) u8g2.sendBuffer(); return; }
+  if(ln.startsWith("LED.RED ")){ if(extCaps.led){ bool on=ln.endsWith("ON"); setLED(on,ledG); } return; }
+  if(ln.startsWith("LED.GREEN ")){ if(extCaps.led){ bool on=ln.endsWith("ON"); setLED(ledR,on); } return; }
+  if(ln.startsWith("BUZZER.TONE ")){ if(!extCaps.buzzer) return; int sp=ln.indexOf(' ',12); int f=ln.substring(12,sp).toInt(); int ms=ln.substring(sp+1).toInt(); tone(BUZZER_PIN,f,ms); return; }
+  if(ln.startsWith("LOG ")){ Serial.println("[SLAVE] "+ln.substring(4)); return; }
+}
+
+// parse #caps line at head of file
+struct Caps { bool oled=true, led=true, buzzer=true; };
+struct Caps parseCapsFromFile(File& f){
+  f.seek(0); Caps c; c.oled=c.led=c.buzzer=true;
+  String first=f.readStringUntil('\n'); first.trim();
+  if(first.startsWith("#caps:")){
+    c.oled   = first.indexOf("OLED")   >=0;
+    c.led    = first.indexOf("LED")    >=0;
+    c.buzzer = first.indexOf("BUZZER") >=0;
+  }
+  f.seek(0); return c;
+}
+
+// send with CRC/ACK (robust retries/timeouts)
+uint16_t crc16(const uint8_t* d, size_t n); // forward reuse
+bool sendChunkCRC(const uint8_t* buf,size_t n){
+  uint16_t cc=crc16(buf,n);
+  String line="DATA ";
+  for(size_t i=0;i<n;i++){ char b[3]; sprintf(b,"%02X",buf[i]); line+=b; }
+  char cb[8]; sprintf(cb,"*%04X",cc);
+  line += " ";
+  line += cb;
+
+  for(int tries=0; tries<5; ++tries){
+    slaveSend(line);
+    uint32_t t0=millis(); String ln;
+    while(millis()-t0<900){
+      if(readSlaveLine(ln)){
+        if(ln=="ACK") return true;
+        if(ln=="NAK") break;   // retransmit entire chunk
+      }
+    }
+  }
+  return false;
+}
+
+bool startExternalApp(const String& name){
+  String path=joinPath(cwd,name);
+  File f=LittleFS.open(path,"r"); if(!f) return false;
+  extCaps=parseCapsFromFile(f);
+  size_t total=f.size(), sent=0;
+  slaveSend("CTRL STARTLOAD "+name+" "+String((unsigned long)total));
+
+  // Wait for READY
+  uint32_t t0=millis(); String ln; bool ready=false;
+  while(millis()-t0<1500){ if(readSlaveLine(ln) && ln=="READY"){ ready=true; break; } }
+  if(!ready){ f.close(); return false; }
+
+  const size_t CH=128; uint8_t buf[CH];
+  while(f.available()){
+    size_t n=f.read(buf,CH);
+    if(!sendChunkCRC(buf,n)){ f.close(); return false; }
+    sent+=n; screenProgress(sent,total,"Sending…");
+  }
+  f.close();
+  slaveSend("CTRL ENDLOAD");
+  slaveSend("CTRL START");
+  extMissedPongs=0; extLastPing=millis(); extRunStartMs=millis(); return true;
+}
+
+// ---------- Boot / Panic ----------
+void drawPanicScreen(){
+  u8g2.clearBuffer(); u8g2.setDrawColor(1); u8g2.drawBox(0,0,128,64); u8g2.setDrawColor(0);
+  u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(2,12,"KERNEL PANIC");
+  u8g2.setFont(u8g2_font_5x8_tf);
+  char l[48]; snprintf(l,sizeof(l),"Uptime: %lu ms",(unsigned long)millis()); u8g2.drawStr(2,24,l);
+  snprintf(l,sizeof(l),"Heap: %lu",(unsigned long)ESP.getFreeHeap()); u8g2.drawStr(2,34,l);
+  u8g2.drawStr(2,58,"Hold SELECT+BACK 2s"); u8g2.sendBuffer();
+}
+void logPanic(const char* reason){
+  ensureDir("/logs"); ensureDir("/sys");
+  File f=LittleFS.open("/logs/panic.txt","a"); if(f){ f.printf("panic: %s, uptime=%lu, heap=%lu\n", reason?reason:"(nil)", (unsigned long)millis(), (unsigned long)ESP.getFreeHeap()); f.close(); }
+  File flag=LittleFS.open("/sys/last_panic.flag","w"); if(flag){ flag.print(reason?reason:"(nil)"); flag.close(); }
+}
+bool     sbHolding=false; uint32_t sbHoldStart=0; String panicReason="Manual panic test";
+void enterPanic(const char* reason){ if(reason) panicReason=reason; logPanic(panicReason.c_str()); setLED(false,false); ui=ST_PANIC; drawPanicScreen(); }
+bool slavePing(uint16_t to=800){ while(Serial2.available()) Serial2.read(); slaveSend("PING"); uint32_t t0=millis(); String ln; while(millis()-t0<to){ if(readSlaveLine(ln)&&ln=="PONG") return true; } return false; }
+void showBootCheck(bool ok){
+  u8g2.clearBuffer(); header("ESPxOS v0.6"); u8g2.setFont(u8g2_font_6x10_tf);
+  if(ok){ u8g2.drawStr(2,TOP_BAR_H+12,"Slave: OK"); setLED(true,true); tone(BUZZER_PIN,1200,120); delay(150); setLED(false,false); }
+  else{ u8g2.drawStr(2,TOP_BAR_H+12,"Slave: NOT FOUND"); for(int i=0;i<3;i++){ digitalWrite(LED_RED,HIGH); tone(BUZZER_PIN,400,100); delay(140); digitalWrite(LED_RED,LOW); delay(140);} }
+  statusLeft("Boot check complete"); u8g2.sendBuffer(); delay(350);
+}
+
+// ---------- Setup ----------
+void setup(){
+  Serial.begin(115200);
+  pinMode(BTN_UP,INPUT_PULLUP); pinMode(BTN_DOWN,INPUT_PULLUP);
+  pinMode(BTN_SELECT,INPUT_PULLUP); pinMode(BTN_BACK,INPUT_PULLUP);
+  pinMode(LED_RED,OUTPUT); pinMode(LED_GREEN,OUTPUT); pinMode(BUZZER_PIN,OUTPUT);
+  u8g2.begin();
+  if(!LittleFS.begin(true)){ u8g2.clearBuffer(); u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(0,32,"LittleFS FAIL"); u8g2.sendBuffer(); while(1); }
+  // settings
+  String s=loadKV("/sys/contrast.cfg"); if(s.length()){ int v=s.toInt(); contrast=constrain(v,0,255);} u8g2.setContrast(contrast);
+  themeInvert = loadKV("/sys/theme.cfg")=="invert";
+  swapUpDown  = loadKV("/sys/keymap_ud.cfg")=="swap";
+  // safe flag?
+  if(LittleFS.exists("/sys/last_panic.flag")) safeMode=true;
+  // seed readme
+  if(!LittleFS.exists("/readme.txt")){ File t=LittleFS.open("/readme.txt","w"); t.println("ESPxOS demo"); t.println("- UP/DOWN move (hold=repeat)"); t.println("- SELECT open/menu"); t.println("- BACK back"); t.close(); }
+  Serial2.begin(SLAVE_BAUD, SERIAL_8N1, SLAVE_RX, SLAVE_TX);
+  bool ok=slavePing(1000); showBootCheck(ok);
+  scanDir("/"); loadLastDir(); scanDir(cwd);
+  if(sel >= (int)entries.size()) sel=max(0,(int)entries.size()-1);
+  lastInputMs=millis();
+  beep(1760,60); delay(60); beep(2200,80); screenHome(); Serial.println("MASTER READY (v0.6)");
+}
+
+// ---------- Loop ----------
+void loop(){
+  idleCheck();
+  pollPCSerial();
+
+  // Slave EXTRUN I/O + watchdog
+  if(ui==ST_EXTRUN){
+    String ln; while(readSlaveLine(ln)){
+      if(ln=="DONE"){ ui=ST_FILES; screenFiles(); setLED(false,false); beep(1200,40); }
+      else if(ln=="ACK"||ln=="NAK"){ /* handled during send */ }
+      else if(ln=="PONG"){ extMissedPongs=0; }
+      else { extMissedPongs=0; renderSlaveCmd(ln); }
+    }
+    if(millis()-extRunStartMs>=WATCHDOG_GRACE_MS){
+      if(millis()-extLastPing>=PING_INTERVAL_MS){
+        extLastPing=millis(); slaveSend("PING"); extMissedPongs++; if(extMissedPongs>=PONG_MISS_LIMIT){ enterPanic("Slave link lost"); return; }
+      }
+    }
+  }
+
+  // 30ms frame
+  static uint32_t frame=0; if(millis()-frame<30) return; frame=millis();
+
+  auto edge = [&](Key& k, const char* name){
+    int ev = edgeRepeat(k);
+    const char* logical = name;
+    if (swapUpDown) {
+      if (strcmp(name, "BTN_UP") == 0)        logical = "BTN_DOWN";
+      else if (strcmp(name, "BTN_DOWN") == 0) logical = "BTN_UP";
+    }
+    if (ev == 1) { touchActivity(); if (ui == ST_EXTRUN) slaveSend(String("EVT ") + logical + "_DOWN"); }
+    if (ev == 2) { touchActivity(); if (ui == ST_EXTRUN) slaveSend(String("EVT ") + logical + "_UP"); }
+    return ev;
+  };
+
+  int eUp=edge(kUp,"BTN_UP"), eDn=edge(kDn,"BTN_DOWN"), eSel=edge(kSel,"BTN_SELECT"), eBk=edge(kBk,"BTN_BACK");
+
+  // long-press BACK = Home (global)
+  static uint32_t backHold=0; if(btnDown(BTN_BACK)){ if(!backHold) backHold=millis(); if(millis()-backHold>1200 && ui!=ST_PANIC){ ui=ST_HOME; screenHome(); }
+  } else backHold=0;
+
+  // Emergency chord
+  static bool chordHold=false; static uint32_t chordStart=0;
+  bool chord = btnDown(BTN_UP)&&btnDown(BTN_DOWN)&&btnDown(BTN_SELECT);
+  if(chord){ if(!chordHold){ chordHold=true; chordStart=millis(); } if(millis()-chordStart>1500) enterPanic("Emergency chord"); } else chordHold=false;
+
+  // Panic lock
+  static uint32_t panicBlink=0; static bool pl=false;
+  if(ui==ST_PANIC){
+    if(millis()-panicBlink>=400){ panicBlink=millis(); pl=!pl; setLED(pl,pl); if(pl) tone(BUZZER_PIN,330,60); drawPanicScreen(); }
+    bool s=btnDown(BTN_SELECT), b=btnDown(BTN_BACK);
+    if(s&&b){ if(!sbHolding){ sbHolding=true; sbHoldStart=millis(); } if(millis()-sbHoldStart>2000){ setLED(false,false); beep(1500,120); ui=ST_HOME; screenHome(); } }
+    else sbHolding=false;
+    return;
+  }
+
+  if(ui==ST_EXTRUN){ if(eBk==1){ slaveSend("CTRL STOP"); ui=ST_FILES; screenFiles(); beep(1200,40);} return; }
+
+  // HOME
+  if(ui==ST_HOME){
+    if(eUp==1){ if(homeSel>0){homeSel--; screenHome(); beep();} }
+    if(eDn==1){ if(homeSel<3){homeSel++; screenHome(); beep();} }
+    if(eSel==1){
+      if(homeSel==0){ ui=ST_FILES; screenFiles(); }
+      else if(homeSel==1){ settingsSel=0; settingsTop=0; ui=ST_SETTINGS; screenSettings(); }
+      else if(homeSel==2){ toolsSel=0; toolsTop=0; ui=ST_TOOLS; screenTools(); }
+      else { u8g2.clearBuffer(); header("About"); u8g2.setFont(u8g2_font_6x10_tf);
+             u8g2.drawStr(2,TOP_BAR_H+12,"ESPxOS v0.6"); u8g2.drawStr(2,TOP_BAR_H+24,"Robust link build"); statusLeft("BK to home"); u8g2.sendBuffer(); }
+      beep(); return;
+    }
+    return;
+  }
+
+  // SETTINGS
+  if(ui==ST_SETTINGS){
+    bool rd=false; if(eUp==1){ if(settingsSel>0){settingsSel--; rd=true; beep();} }
+    if(eDn==1){ if(settingsSel<settingsCount-1){settingsSel++; rd=true; beep();} }
+    if(rd) screenSettings();
+    if(eBk==1){ ui=ST_HOME; screenHome(); beep(1200,40); return; }
+    if(eSel==1){
+      switch(settingsSel){
+        case 0:{ bool ok=slavePing(1000); showBootCheck(ok); screenSettings(); break; }
+        case 1:{ enterPanic("Manual panic test"); break; }
+        case 2:{ ui=ST_ADJUST_CONTRAST; screenContrast(); break; }
+        case 3:{ themeInvert=!themeInvert; saveKV("/sys/theme.cfg", themeInvert?"invert":"normal"); screenSettings(); break; }
+        case 4:{ if(txtFile) txtFile.close(); txtFile=LittleFS.open("/logs/panic.txt","r"); if(!txtFile){ ensureDir("/logs"); File f=LittleFS.open("/logs/panic.txt","w"); if(f){ f.println("No logs yet."); f.close(); } txtFile=LittleFS.open("/logs/panic.txt","r"); } txtOff=0; ui=ST_VIEWTXT; screenViewTxt(); break; }
+        case 5:{ if(LittleFS.exists("/sys/last_panic.flag")) LittleFS.remove("/sys/last_panic.flag"); safeMode=false; screenSettings(); break; }
+        case 6:{ swapUpDown=!swapUpDown; saveKV("/sys/keymap_ud.cfg", swapUpDown?"swap":"normal"); screenSettings(); break; }
+        case 7:{ ui=ST_SYSINFO; screenSysInfo(); break; }
+        case 8:{ // purge trash (shallow)
+                 File dir=LittleFS.open("/trash");
+                 if(dir){ for(File f=dir.openNextFile(); f; f=dir.openNextFile()){ if(f.isDirectory()) LittleFS.rmdir(String(f.name())); else LittleFS.remove(String(f.name())); } LittleFS.rmdir("/trash"); }
+                 screenSettings(); break; }
+        default: ui=ST_HOME; screenHome(); break;
+      }
+      beep(); return;
+    }
+    return;
+  }
+
+  // ADJUST CONTRAST
+  if(ui==ST_ADJUST_CONTRAST){
+    bool ch=false; if(eUp==1&&contrast<255){ contrast++; ch=true; }
+    if(eDn==1&&contrast>0){ contrast--; ch=true; }
+    if(ch){ u8g2.setContrast(contrast); screenContrast(); }
+    if(eSel==1){ saveKV("/sys/contrast.cfg", String(contrast)); ui=ST_SETTINGS; screenSettings(); beep(1200,40); }
+    if(eBk==1){ ui=ST_SETTINGS; screenSettings(); beep(800,40); }
+    return;
+  }
+
+  // TOOLS
+  if(ui==ST_TOOLS){
+    bool rd=false; if(eUp==1){ if(toolsSel>0){toolsSel--; rd=true; beep();} }
+    if(eDn==1){ if(toolsSel<2){toolsSel++; rd=true; beep();} }
+    if(rd) screenTools();
+    if(eBk==1){ ui=ST_HOME; screenHome(); beep(1200,40); return; }
+    if(eSel==1){
+      if(toolsSel==0){ // Stopwatch
+        uint32_t start=millis(), lap=start; bool running=true;
+        while(true){
+          u8g2.clearBuffer(); header("Stopwatch");
+          u8g2.setFont(u8g2_font_6x10_tf);
+          uint32_t t=running? millis()-start: lap-start;
+          char l[32]; snprintf(l,sizeof(l),"%lu.%03lus", (unsigned)(t/1000),(unsigned)(t%1000));
+          u8g2.drawStr(2,TOP_BAR_H+20,l);
+          statusLeft("SEL start/stop  BK exit"); u8g2.sendBuffer();
+          delay(20);
+          int s=edgeRepeat(kSel), b=edgeRepeat(kBk);
+          if(s==1){ running=!running; if(running) start=millis()-(lap-start); else lap=millis(); beep(); }
+          if(b==1){ beep(1200,40); break; }
+        }
+        screenTools();
+      } else if(toolsSel==1){ // Timer (30s quick)
+        uint32_t total=30000, endT=millis()+total;
+        while(true){
+          int32_t left=(int32_t)endT-(int32_t)millis(); if(left<0) left=0;
+          u8g2.clearBuffer(); header("Timer 30s");
+          char l[32]; snprintf(l,sizeof(l),"%lu.%03lus",(unsigned)(left/1000),(unsigned)(left%1000));
+          u8g2.setFont(u8g2_font_6x10_tf); u8g2.drawStr(2,TOP_BAR_H+20,l);
+          u8g2.drawFrame(2,TOP_BAR_H+28,124,8); int w=(int)((total-left)*124.0/total); u8g2.drawBox(3,TOP_BAR_H+29,w,6);
+          statusLeft("BK cancel"); u8g2.sendBuffer();
+          if(left==0){ for(int i=0;i<3;i++){ tone(BUZZER_PIN,1200,120); delay(180);} break; }
+          if(edgeRepeat(kBk)==1){ break; }
+          delay(20);
+        }
+        screenTools();
+      } else { ui=ST_HOME; screenHome(); }
+    }
+    return;
+  }
+
+  // FILES
+  if(ui==ST_FILES){
+    if(eUp==1){ if(sel>0){ sel--; drawFiles(true); beep(); } }
+    if(eDn==1){ if(sel<(int)entries.size()-1){ sel++; drawFiles(true); beep(); } }
+    if(eSel==1){
+      if(entries.empty()){ ctxMode=CTX_DIR_EMPTY; ctxSel=0; ctxTop=0; ui=ST_CTXMENU; screenCtxMenu(); return; }
+      Entry &e=entries[sel];
+      if(e.name==".."){ int p=cwd.lastIndexOf('/'); if(p<=0) { saveLastDir(); scanDir("/"); } else { saveLastDir(); scanDir(cwd.substring(0,p)); } screenFiles(); beep(); return; }
+      if(e.isDir){ saveLastDir(); scanDir(joinPath(cwd,e.name)); screenFiles(); beep(); return; }
+      ctxMode=CTX_FILE; ctxSel=0; ctxTop=0; ui=ST_CTXMENU; screenCtxMenu(); return;
+    }
+    if(eBk==1){
+      saveLastDir();
+      if(cwd!="/"){ int p=cwd.lastIndexOf('/'); if(p<=0) scanDir("/"); else scanDir(cwd.substring(0,p)); screenFiles(); beep(1200,40); }
+      else { ui=ST_HOME; screenHome(); beep(1200,40); }
+    }
+    return;
+  }
+
+  // CTX MENU
+  if(ui==ST_CTXMENU){
+    bool rd=false;
+    if(eUp==1){ if(ctxSel>0){ ctxSel--; rd=true; beep(); } }
+    if(eDn==1){
+      int maxIdx=(ctxMode==CTX_FILE?ctxFileCount: (ctxMode==CTX_DIR?ctxDirCount:ctxEmptyCount))-1;
+      if(ctxSel<maxIdx){ ctxSel++; rd=true; beep(); }
+    }
+    if(rd) screenCtxMenu();
+    if(eBk==1){ ui=ST_FILES; screenFiles(); return; }
+
+    if(eSel==1){
+      if(entries.empty()){ // empty dir menu
+        if(ctxSel==0){ // new folder
+          int n=1; String name; do{name="new_folder_"+String(n++);}while(pathExists(joinPath(cwd,name)));
+          LittleFS.mkdir(joinPath(cwd,name)); scanDir(cwd); ui=ST_FILES; screenFiles();
+        } else if(ctxSel==1){ // new text
+          int n=1; String name; do{name="note_"+String(n++)+".txt";}while(pathExists(joinPath(cwd,name)));
+          File f=LittleFS.open(joinPath(cwd,name),"w"); if(f){ f.println("New file"); f.close(); } scanDir(cwd); ui=ST_FILES; screenFiles();
+        } else if(ctxSel==2){ // paste
+          if(hasMark){
+            String dst=joinPath(cwd, markPath.substring(markPath.lastIndexOf('/')+1));
+            if(markIsDir){ LittleFS.mkdir(dst); File src=LittleFS.open(markPath);
+              for(File ff=src.openNextFile(); ff; ff=ff.openNextFile()){ if(!ff.isDirectory()){ File d=LittleFS.open(joinPath(dst,String(ff.name()).substring(String(ff.name()).lastIndexOf('/')+1)),"w"); while(ff.available()) d.write(ff.read()); d.close(); } }
+            } else { File s=LittleFS.open(markPath,"r"); File d=LittleFS.open(dst,"w"); while(s.available()) d.write(s.read()); s.close(); d.close(); }
+            hasMark=false; scanDir(cwd); ui=ST_FILES; screenFiles();
+          } else { statusLeft("Nothing marked"); u8g2.sendBuffer(); }
+        } else { ui=ST_FILES; screenFiles(); }
+        return;
+      }
+
+      // non-empty selection
+      Entry &e=entries[sel];
+      if(e.name==".." || e.isDir){ // folder menu
+        if(ctxSel==0){ if(e.name==".."){ int p=cwd.lastIndexOf('/'); if(p<=0) scanDir("/"); else scanDir(cwd.substring(0,p)); }
+                        else scanDir(joinPath(cwd,e.name)); ui=ST_FILES; screenFiles(); }
+        else if(ctxSel==1){ propEntry=e; ui=ST_PROPERTIES; screenProps(); }
+        else if(ctxSel==2){ hasMark=true; markPath = (e.name==".." ? "/" : joinPath(cwd,e.name)); markIsDir=true; statusLeft("Marked"); u8g2.sendBuffer(); ui=ST_FILES; }
+        else if(ctxSel==3){ if(e.name==".."){ ui=ST_FILES; screenFiles(); }
+                             else { confirmTitle="Delete to Trash?"; confirmDetail=e.name; confirmYes = [](){ Entry &ee=entries[sel]; moveToTrash(joinPath(cwd,ee.name)); scanDir(cwd); }; ui=ST_CONFIRM; screenConfirm(confirmTitle,confirmDetail); } }
+        else { ui=ST_FILES; screenFiles(); }
+        return;
+      }
+
+      // file menu
+      if(ctxSel==0){ // Open
+        if(e.name.endsWith(".txt")){ if(txtFile) txtFile.close(); txtFile=LittleFS.open(joinPath(cwd,e.name),"r"); if(txtFile){ txtOff=0; ui=ST_VIEWTXT; screenViewTxt(); } else { ui=ST_FILES; screenFiles(); } }
+        else { if(startExternalApp(e.name)){ ui=ST_EXTRUN; setLED(false,false);} else { statusLeft("Send failed"); u8g2.sendBuffer(); } }
+      } else if(ctxSel==1){ // Hex
+        if(hexFile) hexFile.close(); hexFile=LittleFS.open(joinPath(cwd,e.name),"r"); hexOffset=0; ui=ST_HEXVIEW; screenHexView();
+      } else if(ctxSel==2){ // Properties
+        propEntry=e; ui=ST_PROPERTIES; screenProps();
+      } else if(ctxSel==3){ // Rename
+        rnName=e.name; rnAlpha=0; ui=ST_RENAME; screenRename();
+      } else if(ctxSel==4){ // Copy/Move (mark)
+        hasMark=true; markPath=joinPath(cwd,e.name); markIsDir=false; statusLeft("Marked"); u8g2.sendBuffer(); ui=ST_FILES; screenFiles();
+      } else if(ctxSel==5){ // Delete -> Trash
+        confirmTitle="Delete to Trash?"; confirmDetail=e.name;
+        confirmYes=[](){ Entry &ee=entries[sel]; moveToTrash(joinPath(cwd,ee.name)); scanDir(cwd); };
+        ui=ST_CONFIRM; screenConfirm(confirmTitle,confirmDetail);
+      } else { ui=ST_FILES; screenFiles(); }
+      return;
+    }
+    return;
+  }
+
+  // CONFIRM
+  if(ui==ST_CONFIRM){
+    if(eSel==1){ if(confirmYes) confirmYes(); ui=ST_FILES; screenFiles(); }
+    if(eBk==1){ ui=ST_FILES; screenFiles(); }
+    return;
+  }
+
+  // RENAME
+  if(ui==ST_RENAME){
+    bool rd=false; if(eUp==1){ rnAlpha=(rnAlpha+1)%strlen(alpha); rd=true; }
+    if(eDn==1){ rnAlpha=(rnAlpha-1+strlen(alpha))%strlen(alpha); rd=true; }
+    if(eSel==1){ rnName+=alpha[rnAlpha]; rd=true; }
+    if(eBk==1){ // commit
+      Entry &e=entries[sel]; String old=joinPath(cwd,e.name); String neu=joinPath(cwd,rnName);
+      if(old!=neu){ LittleFS.remove(neu); LittleFS.rename(old,neu); scanDir(cwd); }
+      ui=ST_FILES; screenFiles(); return;
+    }
+    if(rd) screenRename(); return;
+  }
+
+  // VIEWTXT
+  if(ui==ST_VIEWTXT){
+    if(eUp==1){ if(txtOff>0) txtOff--; screenViewTxt(); }
+    if(eDn==1){ txtOff++; screenViewTxt(); }
+    if(eSel==1){ txtOff+=6; screenViewTxt(); } // page down
+    if(eBk==1){ if(txtFile) txtFile.close(); ui=ST_FILES; screenFiles(); }
+    return;
+  }
+
+  // HEXVIEW
+  if(ui==ST_HEXVIEW){
+    if(eUp==1){ if(hexOffset>=8) hexOffset-=8; screenHexView(); }
+    if(eDn==1){ hexOffset+=8; if(hexOffset>hexFile.size()) hexOffset=hexFile.size(); screenHexView(); }
+    if(eSel==1){ size_t lines=(64-TOP_BAR_H-STATUS_H)/8; hexOffset += 8*lines; if(hexOffset>hexFile.size()) hexOffset=hexFile.size(); screenHexView(); }
+    if(eBk==1){ if(hexFile) hexFile.close(); ui=ST_FILES; screenFiles(); }
+    return;
+  }
+
+  // PROPERTIES
+  if(ui==ST_PROPERTIES){ if(eBk==1){ ui=ST_FILES; screenFiles(); } return; }
+
+  // SYSINFO
+  if(ui==ST_SYSINFO){ if(eBk==1){ ui=ST_SETTINGS; screenSettings(); } return; }
+}
