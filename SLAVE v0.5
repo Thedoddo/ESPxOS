@@ -1,0 +1,97 @@
+// === SLAVE: ESPxOS DSL + CRC/ACK ===
+// Board: ESP32 Dev Module
+#include <Arduino.h>
+#include <vector>
+#include <map>
+
+#define SLAVE_RX 25
+#define SLAVE_TX 26
+#define BAUD     115200
+
+// Program
+static std::vector<String> prog; std::map<String,int> labels; static int pc=0; static bool running=false; static String lastEvtPrefix="";
+// Event queue
+#define QMAX 16
+static String evq[QMAX]; static int qh=0, qt=0;
+inline bool qEmpty(){ return qh==qt; }
+inline void qPush(const String& s){ evq[qt]=s; qt=(qt+1)%QMAX; if(qt==qh) qh=(qh+1)%QMAX; }
+inline String qPop(){ if(qEmpty()) return ""; String s=evq[qh]; qh=(qh+1)%QMAX; return s; }
+
+// CRC16-CCITT
+uint16_t crc16(const uint8_t* d, size_t n){ uint16_t c=0xFFFF; while(n--){ c^=((uint16_t)*d++)<<8; for(int i=0;i<8;i++) c=(c&0x8000)?(c<<1)^0x1021:(c<<1);} return c; }
+
+// Tokenizer
+struct Tok{ String s; bool isNum=false; int n=0; bool isStr=false; };
+static std::vector<Tok> tokenize(const String& line){
+  std::vector<Tok> out; int i=0,L=line.length(); auto skip=[&]{ while(i<L && isspace((unsigned char)line[i])) i++; }; skip();
+  while(i<L){ if(line[i]=='"'){ i++; String b; while(i<L&&line[i]!='"'){ if(line[i]=='\\'&&i+1<L){ b+=line[i+1]; i+=2; } else b+=line[i++]; } if(i<L&&line[i]=='"') i++; out.push_back({b,false,0,true}); }
+    else if(isdigit((unsigned char)line[i])||line[i]=='-'){ int j=i; if(line[j]=='-') j++; while(j<L&&isdigit((unsigned char)line[j])) j++; int v=atoi(line.substring(i,j).c_str()); out.push_back({"",true,v,false}); i=j; }
+    else { int j=i; while(j<L&&(isalnum((unsigned char)line[j])||line[j]=='.'||line[j]=='_')) j++; out.push_back({line.substring(i,j),false,0,false}); i=j; } skip(); }
+  return out;
+}
+
+// Emit to master
+static void emit(const String& s){ Serial2.print(s); Serial2.print("\n"); }
+static void op_oled_clear(){ emit("OLED.CLEAR"); }
+static void op_oled_text(int x,int y,const String& s){ Serial2.printf("OLED.TEXT %d %d \"",x,y); for(size_t i=0;i<s.length();++i){ char c=s[i]; if(c=='"'||c=='\\') Serial2.print('\\'); Serial2.print(c);} Serial2.println("\""); }
+static void op_oled_update(){ emit("OLED.UPDATE"); }
+static void op_led_red(bool on){ emit(on?"LED.RED ON":"LED.RED OFF"); }
+static void op_led_green(bool on){ emit(on?"LED.GREEN ON":"LED.GREEN OFF"); }
+static void op_buzzer(int f,int ms){ Serial2.printf("BUZZER.TONE %d %d\n",f,ms); }
+
+// Load program
+static void loadProgramText(const String& raw){
+  prog.clear(); labels.clear(); pc=0;
+  int pos=0; while(pos<(int)raw.length()){
+    int nl=raw.indexOf('\n',pos); if(nl<0) nl=raw.length();
+    String r=raw.substring(pos,nl); pos=nl+1; r.replace("\r",""); int h=r.indexOf('#'); if(h>=0) r=r.substring(0,h); r.trim(); if(!r.length()) continue;
+    if(r[0]==':') labels[r.substring(1)]=(int)prog.size(); else prog.push_back(r);
+  }
+  running=true;
+}
+
+// await ANY or BTN_*
+static bool awaitEvent(const String& wantUpper){
+  while(running){
+    while(Serial2.available()){
+      String ln=Serial2.readStringUntil('\n'); ln.replace("\r",""); ln.trim();
+      if(ln.startsWith("EVT ")) qPush(ln.substring(4));
+      else if(ln=="CTRL STOP"){ running=false; emit("DONE"); return false; }
+      else if(ln=="PING"){ emit("PONG"); }
+    }
+    if(!qEmpty()){
+      String e=qPop(); int us=e.lastIndexOf('_'); lastEvtPrefix=(us>=0)?e.substring(0,us):e;
+      if(wantUpper=="ANY" || lastEvtPrefix.equalsIgnoreCase(wantUpper)) return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+static void execLine(const String& line){
+  auto t=tokenize(line); if(t.empty()) return; String op=t[0].s; op.toLowerCase();
+  if      (op=="oled.clear") op_oled_clear();
+  else if (op=="oled.text" && t.size()>=4) op_oled_text(t[1].n,t[2].n, t[3].isStr?t[3].s:t[3].s);
+  else if (op=="oled.update") op_oled_update();
+  else if (op=="led.red")     op_led_red(t.size()>1 && t[1].s.equalsIgnoreCase("on"));
+  else if (op=="led.green")   op_led_green(t.size()>1 && t[1].s.equalsIgnoreCase("on"));
+  else if (op=="buzzer.tone" && t.size()>=3) op_buzzer(t[1].n,t[2].n);
+  else if (op=="sleep" && t.size()>=2) delay(t[1].n);
+  else if (op=="await" && t.size()>=2){ String w=t[1].s; w.trim(); w.toUpperCase(); awaitEvent(w); }
+  else if (op=="goto" && t.size()>=2){ auto it=labels.find(t[1].s); if(it!=labels.end()) pc=it->second; }
+  else if (op=="iflast" && t.size()>=3){ if(lastEvtPrefix.equalsIgnoreCase(t[1].s)){ auto it=labels.find(t[2].s); if(it!=labels.end()) pc=it->second; } }
+}
+
+// Loader protocol with CRC/ACK
+static String incomingHex; static bool collecting=false;
+
+static void onMasterLine(String ln){
+  ln.replace("\r",""); ln.trim();
+  if(ln=="PING"){ Serial2.println("PONG"); }
+  else if(ln.startsWith("CTRL STARTLOAD ")){ incomingHex=""; collecting=true; Serial2.println("READY"); }
+  else if(ln.startsWith("DATA ")){
+    if(!collecting){ Serial2.println("NAK"); return; }
+    int star=ln.lastIndexOf('*'); if(star<6){ Serial2.println("NAK"); return; }
+    String hex=ln.substring(5, star-1); String cs=ln.substring(star+1);
+    // decode
+    std::vector<uint8_t> buf; buf.reserve(hex.length()/2
