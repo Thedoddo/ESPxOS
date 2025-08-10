@@ -1,1 +1,82 @@
-A os for esp32 microcontrollers
+# ESPxOS
+
+ESPxOS is a lightweight operating system for a pair of ESP32 boards. The "master" board hosts the UI, filesystem and watchdog, while a "slave" board runs a small domain-specific language (DSL) and reports events back to the master.
+
+## Hardware requirements
+
+- Two ESP32 Dev Module boards
+- 128x64 I²C OLED display (SCL → GPIO18, SDA → GPIO5)
+- Buttons: Up (GPIO23), Down (GPIO22), Select (GPIO21), Back (GPIO19)
+- LEDs: Red (GPIO12), Green (GPIO14)
+- Piezo buzzer on GPIO17
+- Cross-over serial link: Master TX26 → Slave RX25, Master RX25 ← Slave TX26 @ 115200 baud
+
+## Default pin mappings
+
+| Function      | GPIO |
+|---------------|------|
+| OLED SCL      | 18 |
+| OLED SDA      | 5 |
+| Button Up     | 23 |
+| Button Down   | 22 |
+| Button Select | 21 |
+| Button Back   | 19 |
+| LED Red       | 12 |
+| LED Green     | 14 |
+| Buzzer        | 17 |
+| Slave RX      | 25 |
+| Slave TX      | 26 |
+| Serial baud   | 115200 |
+
+## Flashing
+
+### Arduino IDE
+1. Install ESP32 board support via Boards Manager.
+2. Install libraries: U8g2 and LittleFS.
+3. Open **MASTER v0.5** and upload to the first ESP32.
+4. Open **SLAVE v0.5** and upload to the second ESP32.
+
+### Arduino CLI
+```bash
+arduino-cli core install esp32:esp32
+arduino-cli compile --fqbn esp32:esp32:esp32 "MASTER v0.5"
+arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 "MASTER v0.5"
+arduino-cli compile --fqbn esp32:esp32:esp32 "SLAVE v0.5"
+arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB1 "SLAVE v0.5"
+```
+
+### PlatformIO
+1. Create two environments targeting `esp32dev`.
+2. Place `MASTER v0.5` and `SLAVE v0.5` as `src/main.cpp` in each environment.
+3. Run `pio run -t upload` for each board.
+
+## Master/Slave Architecture
+
+The master provides the user interface, persistent storage and health monitoring. It communicates with the slave over `Serial2` using a line-based protocol. The slave loads DSL programs and emits events such as `EVT BTN_UP` back to the master.
+
+### Example DSL commands
+```
+OLED.CLEAR
+OLED.TEXT 0 16 "Hi"
+OLED.UPDATE
+LED.RED ON
+SLEEP 500
+LED.RED OFF
+AWAIT BTN_UP
+GOTO start
+```
+Other commands include `LED.GREEN on/off`, `BUZZER.TONE <freq> <ms>`, `AWAIT <ANY|BTN_*>`, and `IFLAST <event> <label>`.
+
+## Troubleshooting
+
+- Display blank: verify OLED wiring and power.
+- No master/slave link: check TX/RX cross-over and baud rate.
+- Buttons unresponsive: ensure correct GPIO connections.
+- DSL program stuck on `AWAIT`: master must emit `EVT BTN_*` events.
+
+## Contributing / Extending
+
+- Fork the repository and create feature branches.
+- Master firmware lives in `MASTER v0.5`, slave runtime in `SLAVE v0.5`.
+- Extend the DSL by adding new operations in the slave's `execLine`.
+- Submit pull requests with a clear description and run available tests.
