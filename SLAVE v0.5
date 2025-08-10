@@ -93,5 +93,26 @@ static void onMasterLine(String ln){
     if(!collecting){ Serial2.println("NAK"); return; }
     int star=ln.lastIndexOf('*'); if(star<6){ Serial2.println("NAK"); return; }
     String hex=ln.substring(5, star-1); String cs=ln.substring(star+1);
-    // decode
-    std::vector<uint8_t> buf; buf.reserve(hex.length()/2
+    std::vector<uint8_t> buf; buf.reserve(hex.length()/2);
+    for(int i=0;i+1<hex.length();i+=2){ char hb[3]={hex[i],hex[i+1],0}; buf.push_back((uint8_t)strtol(hb,nullptr,16)); }
+    uint16_t calc=crc16(buf.data(), buf.size());
+    uint16_t given=(uint16_t)strtol(cs.c_str(), nullptr,16);
+    if(calc==given){ for(uint8_t b:buf) incomingHex+=char(b); Serial2.println("ACK"); }
+    else { Serial2.println("NAK"); }
+  }
+  else if(ln.startsWith("CTRL ENDLOAD")){ collecting=false; loadProgramText(incomingHex); }
+  else if(ln.startsWith("CTRL START")){ pc=0; running=true; }
+}
+
+void setup(){ Serial2.begin(BAUD, SERIAL_8N1, SLAVE_RX, SLAVE_TX); }
+
+void loop(){
+  while(Serial2.available()){
+    String ln=Serial2.readStringUntil('\n');
+    onMasterLine(ln);
+  }
+  if(running){
+    if(pc < (int)prog.size()) execLine(prog[pc++]);
+    else { running=false; emit("DONE"); }
+  }
+}
